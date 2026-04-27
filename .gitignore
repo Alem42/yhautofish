@@ -1,6 +1,8 @@
 # Python cache
 __pycache__/
 *.py[cod]
+.venv/
+logs/
 
 # PyInstaller output
 build/
@@ -12,4 +14,3 @@ dist/
 .idea/
 Thumbs.db
 Desktop.ini
-

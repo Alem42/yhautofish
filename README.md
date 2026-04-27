@@ -11,13 +11,6 @@ Windows 自动钓鱼辅助脚本。脚本会按窗口标题查找游戏窗口，
 ![alt text](image.png)
 5. 按 `F10` 开始，按 `F12` 停止。
 
-## 开发运行
-
-```powershell
-py -3.9 autofish.py
-```
-
-如果游戏以管理员权限运行，脚本也需要管理员权限运行。
 
 ## 坐标校准
 
@@ -36,16 +29,3 @@ RIGHT_CLICK_REF_X = ...
 RIGHT_CLICK_REF_Y = ...
 ```
 
-## 打包 exe
-
-双击运行：
-
-```text
-make_python_exe.bat
-```
-
-输出文件会生成到：
-
-```text
-dist/FishAutoPython.exe
-```

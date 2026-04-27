@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import ctypes
+import logging
+import os
 import sys
+import threading
 import time
 from ctypes import wintypes
 
@@ -9,6 +12,12 @@ from ctypes import wintypes
 # ===== Config =====
 TARGET_TITLE_KEYWORD = "\u5f02\u73af"
 LOG_ENABLED = True
+LOG_FILE = "logs/autofish.log"
+OCR_ENABLED = True
+OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"
+OCR_INTERVAL_MS = 1000
+OCR_PRINT_COOLDOWN_MS = 2000
+OCR_REGION_REF = (450, 120, 1020, 520)
 
 # Coordinates from the original macro, measured on a 1920x1080 game client.
 # They are scaled to the current game window client size at runtime.
@@ -71,14 +80,30 @@ except Exception:
     pass
 
 
+def setup_logging():
+    log_dir = os.path.dirname(LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(threadName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
+
+
 def delay(ms):
     time.sleep(ms / 1000.0)
 
 
 def log(message):
     if LOG_ENABLED:
-        now = time.strftime("%H:%M:%S")
-        print(f"[{now}] {message}", flush=True)
+        logging.info(message)
 
 
 def is_admin():
@@ -96,13 +121,17 @@ def stop_requested():
     return is_pressed(VK_F12)
 
 
-def wait(ms):
+def wait(ms, stop_event=None):
     """Delay in small steps, so F12 can stop quickly."""
     log(f"Wait {ms}ms")
     end = time.perf_counter() + ms / 1000.0
     while time.perf_counter() < end:
+        if stop_event is not None and stop_event.is_set():
+            raise KeyboardInterrupt
         if stop_requested():
             log("F12 detected")
+            if stop_event is not None:
+                stop_event.set()
             raise KeyboardInterrupt
         delay(50)
 
@@ -189,8 +218,9 @@ def window_title(hwnd):
     return buf.value
 
 
-def find_window(keyword):
-    log(f"Find window by title keyword: {keyword}")
+def find_window(keyword, announce=True):
+    if announce:
+        log(f"Find window by title keyword: {keyword}")
     found = None
 
     @EnumWindowsProc
@@ -227,34 +257,118 @@ def activate_window():
     return hwnd
 
 
-def fish_once():
+def ref_region_to_screen(hwnd, ref_region):
+    rect = get_client_rect(hwnd)
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    ref_left, ref_top, ref_right, ref_bottom = ref_region
+    client_left = ref_left * width / REFERENCE_WIDTH
+    client_top = ref_top * height / REFERENCE_HEIGHT
+    client_right = ref_right * width / REFERENCE_WIDTH
+    client_bottom = ref_bottom * height / REFERENCE_HEIGHT
+    screen_left, screen_top = client_to_screen(hwnd, client_left, client_top)
+    screen_right, screen_bottom = client_to_screen(hwnd, client_right, client_bottom)
+    return screen_left, screen_top, screen_right, screen_bottom
+
+
+def capture_client_image(hwnd, ref_region=None):
+    import mss
+    import numpy as np
+
+    if ref_region:
+        left, top, right, bottom = ref_region_to_screen(hwnd, ref_region)
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+    else:
+        rect = get_client_rect(hwnd)
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        left, top = client_to_screen(hwnd, 0, 0)
+
+    log(f"OCR capture region screen=({left},{top},{width},{height})")
+
+    with mss.mss() as sct:
+        shot = sct.grab({
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        })
+
+    # EasyOCR expects RGB image data. MSS returns BGRA.
+    return np.asarray(shot)[:, :, :3][:, :, ::-1]
+
+
+def text_seen(result, target):
+    text = "".join(str(item) for item in result).replace(" ", "")
+    return target in text
+
+
+def format_ocr_result(result):
+    cleaned = [str(text).strip() for text in result if str(text).strip()]
+    return " | ".join(cleaned)
+
+
+def ocr_loop(stop_event):
+    if not OCR_ENABLED:
+        return
+
+    try:
+        import easyocr
+
+        log("OCR thread loading EasyOCR model...")
+        reader = easyocr.Reader(["ch_sim", "en"], gpu=False)
+        log("OCR thread ready.")
+
+        last_print = 0
+        while not stop_event.is_set():
+            hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
+            if hwnd:
+                image = capture_client_image(hwnd, OCR_REGION_REF)
+                result = reader.readtext(image, detail=0, paragraph=True)
+                text = format_ocr_result(result)
+                seen = text_seen(result, OCR_TARGET_TEXT)
+                if text:
+                    now = time.perf_counter()
+                    if (now - last_print) * 1000 >= OCR_PRINT_COOLDOWN_MS:
+                        status = "MATCH" if seen else "TEXT"
+                        log(f"OCR {status}: {text}")
+                        last_print = now
+
+            stop_event.wait(OCR_INTERVAL_MS / 1000.0)
+    except Exception as exc:
+        logging.exception("OCR thread stopped by error: %s", exc)
+        log("OCR disabled for this run; action loop will continue.")
+
+
+def fish_once(stop_event):
     log("=== New loop ===")
     hwnd = activate_window()
     if not hwnd:
-        wait(1000)
+        wait(1000, stop_event)
         return
 
     if FOCUS_CENTER_BEFORE_ACTION:
         click_client_center(hwnd)
-        wait(300)
+        wait(300, stop_event)
 
-    wait(500)
+    wait(500, stop_event)
     log("First F")
     press_key(VK_F, 110)
 
-    wait(7000)
+    wait(7000, stop_event)
     log("Second F")
     press_key(VK_F, 110)
 
-    wait(400)
+    wait(400, stop_event)
     log("Click left target")
     click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
 
-    wait(8000)
+    wait(8000, stop_event)
     log("Click right target")
     click_at(*scaled_client_point(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y))
 
-    wait(400)
+    wait(400, stop_event)
     log("Press Esc")
     press_key(VK_ESC, 110)
 
@@ -275,20 +389,59 @@ def wait_for_start():
         delay(50)
 
 
+def action_loop(stop_event):
+    try:
+        while not stop_event.is_set():
+            if stop_requested():
+                stop_event.set()
+                break
+            fish_once(stop_event)
+    except KeyboardInterrupt:
+        stop_event.set()
+    except Exception as exc:
+        logging.exception("Action thread stopped by error: %s", exc)
+        stop_event.set()
+
+
 def main():
+    setup_logging()
+    log("Log file: " + os.path.abspath(LOG_FILE))
+
     if not wait_for_start():
         return
 
+    stop_event = threading.Event()
+    threads = [
+        threading.Thread(target=ocr_loop, args=(stop_event,), name="OCR"),
+        threading.Thread(target=action_loop, args=(stop_event,), name="Action"),
+    ]
+
+    for thread in threads:
+        thread.start()
+
     try:
-        while True:
+        while not stop_event.is_set():
             if stop_requested():
+                log("F12 detected in main thread")
+                stop_event.set()
                 break
-            fish_once()
+            delay(50)
     except KeyboardInterrupt:
-        pass
+        stop_event.set()
+    except Exception as exc:
+        logging.exception("Main thread stopped by error: %s", exc)
+        stop_event.set()
+
+    for thread in threads:
+        thread.join()
 
     log("Stopped.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        setup_logging()
+        logging.exception("Fatal error: %s", exc)
+        raise
