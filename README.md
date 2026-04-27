@@ -5,9 +5,11 @@ Windows 自动钓鱼辅助脚本。脚本会按窗口标题查找游戏窗口，
 ## 使用方式
 
 1. 打开游戏并保持目标窗口标题包含 `异环`。
-2. 运行 `dist/YhFishAuto0.0.1.exe` 或自己重新打包得到的 exe。
-3. 同意管理员权限弹窗。
-4. 按 `F10` 开始，按 `F12` 停止。
+2. 运行 `dist/YhFishAuto0.0.1.exe` 
+3. （可能）同意管理员权限弹窗。
+4. 亲自前往钓鱼点并点击开始钓鱼，进入这个页面
+![alt text](image.png)
+5. 按 `F10` 开始，按 `F12` 停止。
 
 ## 开发运行
 
@@ -47,7 +49,3 @@ make_python_exe.bat
 ```text
 dist/FishAutoPython.exe
 ```
-
-## 版本管理建议
-
-源码、脚本、README 提交到 GitHub；`build/`、`dist/`、`__pycache__/` 不提交。需要分发 exe 时，把 `dist` 里的 exe 上传到 GitHub Releases。
