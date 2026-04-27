@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Local editor/system files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
