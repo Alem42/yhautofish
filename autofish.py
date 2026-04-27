@@ -14,19 +14,26 @@ TARGET_TITLE_KEYWORD = "\u5f02\u73af"
 LOG_ENABLED = True
 LOG_FILE = "logs/autofish.log"
 OCR_ENABLED = True
+OCR_GPU_MODE = "auto"
 OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"
+OCR_BITE_KEYWORDS = (
+    "\u9c7c\u4e0a\u94a9",
+    "\u4e0a\u94a9",
+)
 OCR_INTERVAL_MS = 1000
 OCR_PRINT_COOLDOWN_MS = 2000
 OCR_REGION_REF = (450, 120, 1020, 520)
+BITE_WAIT_TIMEOUT_MS = 20000
+OCR_READY_TIMEOUT_MS = 60000
 
 # Coordinates from the original macro, measured on a 1920x1080 game client.
 # They are scaled to the current game window client size at runtime.
 REFERENCE_WIDTH = 1920
 REFERENCE_HEIGHT = 1080
-LEFT_CLICK_REF_X = 89
-LEFT_CLICK_REF_Y = 1085
-RIGHT_CLICK_REF_X = 1900
-RIGHT_CLICK_REF_Y = 1085
+LEFT_CLICK_REF_X = 60
+LEFT_CLICK_REF_Y = 1020
+RIGHT_CLICK_REF_X = 1880
+RIGHT_CLICK_REF_Y = 1040
 
 # Click the game content once before the loop starts sending keys.
 FOCUS_CENTER_BEFORE_ACTION = True
@@ -40,6 +47,11 @@ SW_RESTORE = 9
 KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+
+OCR_READY_EVENT = threading.Event()
+BITE_DETECTED_EVENT = threading.Event()
+LAST_OCR_TEXT_LOCK = threading.Lock()
+LAST_OCR_TEXT = ""
 
 
 # ===== WinAPI =====
@@ -300,13 +312,92 @@ def capture_client_image(hwnd, ref_region=None):
 
 
 def text_seen(result, target):
-    text = "".join(str(item) for item in result).replace(" ", "")
-    return target in text
+    return target in normalize_text(format_ocr_result(result))
+
+
+def normalize_text(text):
+    ignored = set(" \t\r\n,，.。!！?？:：;；|/\\-_—[]()（）{}<>《》\"'`")
+    return "".join(ch for ch in str(text) if ch not in ignored)
+
+
+def text_seen_any(text, keywords):
+    normalized = normalize_text(text)
+    return any(keyword in normalized for keyword in keywords)
+
+
+def set_last_ocr_text(text):
+    global LAST_OCR_TEXT
+    with LAST_OCR_TEXT_LOCK:
+        LAST_OCR_TEXT = text
+
+
+def get_last_ocr_text():
+    with LAST_OCR_TEXT_LOCK:
+        return LAST_OCR_TEXT
 
 
 def format_ocr_result(result):
     cleaned = [str(text).strip() for text in result if str(text).strip()]
     return " | ".join(cleaned)
+
+
+def wait_for_ocr_ready(stop_event):
+    if not OCR_ENABLED:
+        log("OCR disabled; skip waiting for OCR model.")
+        return False
+
+    log("Wait for OCR model ready.")
+    end = time.perf_counter() + OCR_READY_TIMEOUT_MS / 1000.0
+    while time.perf_counter() < end:
+        if stop_event.is_set() or stop_requested():
+            stop_event.set()
+            raise KeyboardInterrupt
+        if OCR_READY_EVENT.is_set():
+            log("OCR model ready; action loop can start.")
+            return True
+        delay(100)
+
+    log("OCR model ready timeout; continue with timeout fallback.")
+    return False
+
+
+def wait_for_bite_text(stop_event):
+    log("Wait until OCR sees bite text.")
+    end = time.perf_counter() + BITE_WAIT_TIMEOUT_MS / 1000.0
+    while time.perf_counter() < end:
+        if stop_event.is_set() or stop_requested():
+            stop_event.set()
+            raise KeyboardInterrupt
+        if BITE_DETECTED_EVENT.is_set():
+            log(f"Bite text detected: {get_last_ocr_text()}")
+            BITE_DETECTED_EVENT.clear()
+            return True
+        delay(50)
+
+    log(f"Bite text timeout; last OCR text: {get_last_ocr_text()}")
+    return False
+
+
+def should_use_ocr_gpu():
+    if OCR_GPU_MODE is True:
+        return True
+    if OCR_GPU_MODE is False:
+        return False
+    if str(OCR_GPU_MODE).lower() != "auto":
+        return False
+
+    try:
+        import torch
+
+        available = torch.cuda.is_available()
+        if available:
+            log(f"OCR GPU available: {torch.cuda.get_device_name(0)}")
+        else:
+            log(f"OCR GPU unavailable; torch={torch.__version__}")
+        return available
+    except Exception as exc:
+        log(f"OCR GPU check failed: {exc}")
+        return False
 
 
 def ocr_loop(stop_event):
@@ -317,8 +408,11 @@ def ocr_loop(stop_event):
         import easyocr
 
         log("OCR thread loading EasyOCR model...")
-        reader = easyocr.Reader(["ch_sim", "en"], gpu=False)
+        use_gpu = should_use_ocr_gpu()
+        log(f"OCR EasyOCR gpu={use_gpu}")
+        reader = easyocr.Reader(["ch_sim", "en"], gpu=use_gpu)
         log("OCR thread ready.")
+        OCR_READY_EVENT.set()
 
         last_print = 0
         while not stop_event.is_set():
@@ -327,17 +421,28 @@ def ocr_loop(stop_event):
                 image = capture_client_image(hwnd, OCR_REGION_REF)
                 result = reader.readtext(image, detail=0, paragraph=True)
                 text = format_ocr_result(result)
+                set_last_ocr_text(text)
                 seen = text_seen(result, OCR_TARGET_TEXT)
+                bite_seen = text_seen_any(text, OCR_BITE_KEYWORDS)
+                if bite_seen:
+                    BITE_DETECTED_EVENT.set()
+
                 if text:
                     now = time.perf_counter()
                     if (now - last_print) * 1000 >= OCR_PRINT_COOLDOWN_MS:
-                        status = "MATCH" if seen else "TEXT"
+                        if bite_seen:
+                            status = "BITE"
+                        elif seen:
+                            status = "MATCH"
+                        else:
+                            status = "TEXT"
                         log(f"OCR {status}: {text}")
                         last_print = now
 
             stop_event.wait(OCR_INTERVAL_MS / 1000.0)
     except Exception as exc:
         logging.exception("OCR thread stopped by error: %s", exc)
+        OCR_READY_EVENT.set()
         log("OCR disabled for this run; action loop will continue.")
 
 
@@ -352,15 +457,25 @@ def fish_once(stop_event):
         click_client_center(hwnd)
         wait(300, stop_event)
 
+
     wait(500, stop_event)
     log("First F")
+    BITE_DETECTED_EVENT.clear()
     press_key(VK_F, 110)
 
-    wait(7000, stop_event)
+    wait_for_bite_text(stop_event)
     log("Second F")
     press_key(VK_F, 110)
 
-    wait(400, stop_event)
+    wait(100, stop_event)
+    log("Click left target")
+    click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
+
+    wait(600, stop_event)
+    log("Click left target")
+    click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
+    
+    wait(100, stop_event)
     log("Click left target")
     click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
 
@@ -391,6 +506,7 @@ def wait_for_start():
 
 def action_loop(stop_event):
     try:
+        wait_for_ocr_ready(stop_event)
         while not stop_event.is_set():
             if stop_requested():
                 stop_event.set()
