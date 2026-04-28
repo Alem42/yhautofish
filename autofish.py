@@ -20,10 +20,20 @@ OCR_BITE_KEYWORDS = (
     "\u9c7c\u4e0a\u94a9",
     "\u4e0a\u94a9",
 )
+OCR_CLOSE_KEYWORDS = (
+    "\u70b9\u51fb\u7a7a\u767d\u533a\u57df\u5173\u95ed",
+    "\u70b9\u51fb\u7a7a\u767d",
+    "\u7a7a\u767d\u533a\u57df",
+    "\u533a\u57df\u5173\u95ed",
+)
 OCR_INTERVAL_MS = 1000
 OCR_PRINT_COOLDOWN_MS = 2000
-OCR_REGION_REF = (450, 120, 1020, 520)
+OCR_REGIONS_REF = (
+    (450, 120, 1020, 520),
+    (620, 850, 1300, 1060),
+)
 BITE_WAIT_TIMEOUT_MS = 20000
+CLOSE_WAIT_TIMEOUT_MS = 45000
 OCR_READY_TIMEOUT_MS = 60000
 
 # Coordinates from the original macro, measured on a 1920x1080 game client.
@@ -50,6 +60,7 @@ MOUSEEVENTF_LEFTUP = 0x0004
 
 OCR_READY_EVENT = threading.Event()
 BITE_DETECTED_EVENT = threading.Event()
+CLOSE_DETECTED_EVENT = threading.Event()
 LAST_OCR_TEXT_LOCK = threading.Lock()
 LAST_OCR_TEXT = ""
 
@@ -341,6 +352,17 @@ def format_ocr_result(result):
     return " | ".join(cleaned)
 
 
+def read_ocr_regions(reader, hwnd):
+    texts = []
+    for region in OCR_REGIONS_REF:
+        image = capture_client_image(hwnd, region)
+        result = reader.readtext(image, detail=0, paragraph=True)
+        text = format_ocr_result(result)
+        if text:
+            texts.append(text)
+    return " | ".join(texts)
+
+
 def wait_for_ocr_ready(stop_event):
     if not OCR_ENABLED:
         log("OCR disabled; skip waiting for OCR model.")
@@ -375,6 +397,23 @@ def wait_for_bite_text(stop_event):
         delay(50)
 
     log(f"Bite text timeout; last OCR text: {get_last_ocr_text()}")
+    return False
+
+
+def wait_for_close_text(stop_event):
+    log("Wait until OCR sees close text.")
+    end = time.perf_counter() + CLOSE_WAIT_TIMEOUT_MS / 1000.0
+    while time.perf_counter() < end:
+        if stop_event.is_set() or stop_requested():
+            stop_event.set()
+            raise KeyboardInterrupt
+        if CLOSE_DETECTED_EVENT.is_set():
+            log(f"Close text detected: {get_last_ocr_text()}")
+            CLOSE_DETECTED_EVENT.clear()
+            return True
+        delay(50)
+
+    log(f"Close text timeout; last OCR text: {get_last_ocr_text()}")
     return False
 
 
@@ -418,19 +457,22 @@ def ocr_loop(stop_event):
         while not stop_event.is_set():
             hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
             if hwnd:
-                image = capture_client_image(hwnd, OCR_REGION_REF)
-                result = reader.readtext(image, detail=0, paragraph=True)
-                text = format_ocr_result(result)
+                text = read_ocr_regions(reader, hwnd)
                 set_last_ocr_text(text)
-                seen = text_seen(result, OCR_TARGET_TEXT)
+                seen = OCR_TARGET_TEXT in normalize_text(text)
                 bite_seen = text_seen_any(text, OCR_BITE_KEYWORDS)
+                close_seen = text_seen_any(text, OCR_CLOSE_KEYWORDS)
                 if bite_seen:
                     BITE_DETECTED_EVENT.set()
+                if close_seen:
+                    CLOSE_DETECTED_EVENT.set()
 
                 if text:
                     now = time.perf_counter()
                     if (now - last_print) * 1000 >= OCR_PRINT_COOLDOWN_MS:
-                        if bite_seen:
+                        if close_seen:
+                            status = "CLOSE"
+                        elif bite_seen:
                             status = "BITE"
                         elif seen:
                             status = "MATCH"
@@ -470,13 +512,11 @@ def fish_once(stop_event):
 
     wait(600, stop_event)
     log("Click left target")
+    CLOSE_DETECTED_EVENT.clear()
     click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
     
-    wait(100, stop_event)
-    log("Click left target")
-    click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
 
-    wait(8000, stop_event)
+    wait_for_close_text(stop_event)
     log("Click right target")
     click_at(*scaled_client_point(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y))
 
