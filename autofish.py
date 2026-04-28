@@ -467,9 +467,6 @@ def fish_once(stop_event):
     log("Second F")
     press_key(VK_F, 110)
 
-    wait(100, stop_event)
-    log("Click left target")
-    click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
 
     wait(600, stop_event)
     log("Click left target")
