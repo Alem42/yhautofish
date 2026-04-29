@@ -10,11 +10,13 @@ from ctypes import wintypes
 
 
 # ===== Config =====
+# Window / logging / OCR switches.
 TARGET_TITLE_KEYWORD = "\u5f02\u73af"
 LOG_ENABLED = True
 LOG_FILE = "logs/autofish.log"
 OCR_ENABLED = True
 OCR_GPU_MODE = "auto"
+# OCR target texts.
 OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"
 OCR_BITE_KEYWORDS = (
     "\u9c7c\u4e0a\u94a9",
@@ -27,7 +29,7 @@ OCR_CLOSE_KEYWORDS = (
     "\u533a\u57df\u5173\u95ed",
 )
 OCR_START_FISH_TEXT = "\u5f00\u59cb\u9493\u9c7c"       # "开始钓鱼"
-OCR_LOST_FISH_TEXT = "\u9c7c\u513f\u6e9c\u8d70\u4e86"
+OCR_LOST_FISH_TEXT = "\u9c7c\u513f\u6e9c\u8d70\u4e86"   # "鱼儿溜走了"
 OCR_INTERVAL_MS = 1000
 OCR_PRINT_COOLDOWN_MS = 2000
 # OCR regions are based on a 1920x1080 client reference. They are split by
@@ -69,6 +71,7 @@ KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
+# Cross-thread runtime state shared by the OCR thread and the action thread.
 OCR_READY_EVENT = threading.Event()
 BITE_DETECTED_EVENT = threading.Event()
 CLOSE_DETECTED_EVENT = threading.Event()
@@ -79,6 +82,7 @@ LAST_OCR_TEXT = ""
 
 
 class RestartLoop(Exception):
+    """Raised when OCR tells the action loop to abandon the current cycle."""
     pass
 
 
@@ -120,6 +124,7 @@ except Exception:
     pass
 
 
+# ===== Logging / timing helpers =====
 def setup_logging():
     log_dir = os.path.dirname(LOG_FILE)
     if log_dir:
@@ -161,6 +166,7 @@ def stop_requested():
     return is_pressed(VK_F12)
 
 
+# ===== OCR-driven restart hooks =====
 def maybe_restart_from_start_fishing():
     if not START_FISH_DETECTED_EVENT.is_set():
         return
@@ -226,6 +232,7 @@ def wait(ms, stop_event=None):
         delay(50)
 
 
+# ===== Mouse / keyboard input helpers =====
 def key_down(vk):
     user32.keybd_event(vk, 0, 0, 0)
 
@@ -260,6 +267,7 @@ def click_at(x, y):
     left_click()
 
 
+# ===== Window and coordinate helpers =====
 def get_client_rect(hwnd):
     rect = wintypes.RECT()
     if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
@@ -309,6 +317,7 @@ def window_title(hwnd):
 
 
 def find_window(keyword, announce=True):
+    """Find the first visible top-level window whose title contains keyword."""
     if announce:
         log(f"Find window by title keyword: {keyword}")
     found = None
@@ -328,6 +337,7 @@ def find_window(keyword, announce=True):
 
 
 def activate_window():
+    """Restore the game window and bring it to the foreground."""
     hwnd = find_window(TARGET_TITLE_KEYWORD)
     if not hwnd:
         log(f"Cannot find window: {TARGET_TITLE_KEYWORD}")
@@ -362,6 +372,7 @@ def ref_region_to_screen(hwnd, ref_region):
 
 
 def capture_client_image(hwnd, ref_region=None):
+    """Capture the whole client or a reference sub-region for OCR."""
     import mss
     import numpy as np
 
@@ -389,6 +400,7 @@ def capture_client_image(hwnd, ref_region=None):
     return np.asarray(shot)[:, :, :3][:, :, ::-1]
 
 
+# ===== OCR text helpers =====
 def text_seen(result, target):
     return target in normalize_text(format_ocr_result(result))
 
@@ -440,7 +452,67 @@ def read_ocr_region(reader, hwnd, region):
     return format_ocr_result(result)
 
 
+def read_ocr_snapshot(reader, hwnd):
+    """Read every OCR region once and return named text blocks."""
+    return {
+        "bite_text": read_ocr_regions(reader, hwnd),
+        "close_text": read_ocr_region(reader, hwnd, OCR_CLOSE_REGIONS_REF[0]),
+        "lost_fish_text": read_ocr_region(reader, hwnd, OCR_LOST_FISH_REGION_REF),
+        "start_fish_text": read_ocr_region(reader, hwnd, OCR_START_FISH_REGION_REF),
+    }
+
+
+def update_detection_events(snapshot):
+    """Update cross-thread event flags from one OCR snapshot."""
+    bite_text = snapshot["bite_text"]
+    close_text = snapshot["close_text"]
+    lost_fish_text = snapshot["lost_fish_text"]
+    start_fish_text = snapshot["start_fish_text"]
+
+    bite_seen = text_seen_any(bite_text, OCR_BITE_KEYWORDS)
+    close_seen = text_seen_any(close_text, OCR_CLOSE_KEYWORDS)
+    lost_fish_seen = text_seen_exact(lost_fish_text, OCR_LOST_FISH_TEXT)
+    start_fish_seen = normalize_text(OCR_START_FISH_TEXT) in normalize_text(start_fish_text)
+    target_seen = OCR_TARGET_TEXT in normalize_text(bite_text)
+
+    if bite_seen:
+        BITE_DETECTED_EVENT.set()
+    if close_seen:
+        CLOSE_DETECTED_EVENT.set()
+    if lost_fish_seen:
+        LOST_FISH_DETECTED_EVENT.set()
+    else:
+        LOST_FISH_DETECTED_EVENT.clear()
+    if start_fish_seen:
+        START_FISH_DETECTED_EVENT.set()
+
+    snapshot["bite_seen"] = bite_seen
+    snapshot["close_seen"] = close_seen
+    snapshot["lost_fish_seen"] = lost_fish_seen
+    snapshot["start_fish_seen"] = start_fish_seen
+    snapshot["target_seen"] = target_seen
+    snapshot["combined_text"] = " | ".join(part for part in snapshot.values() if isinstance(part, str) and part)
+    set_last_ocr_text(snapshot["combined_text"])
+    return snapshot
+
+
+def ocr_status(snapshot):
+    """Pick the most important label for logging this OCR pass."""
+    if snapshot["start_fish_seen"]:
+        return "START"
+    if snapshot["lost_fish_seen"]:
+        return "LOST"
+    if snapshot["close_seen"]:
+        return "CLOSE"
+    if snapshot["bite_seen"]:
+        return "BITE"
+    if snapshot["target_seen"]:
+        return "MATCH"
+    return "TEXT"
+
+
 def wait_for_ocr_ready(stop_event):
+    """Block the action thread until OCR is ready or timeout occurs."""
     if not OCR_ENABLED:
         log("OCR disabled; skip waiting for OCR model.")
         return False
@@ -461,6 +533,7 @@ def wait_for_ocr_ready(stop_event):
 
 
 def wait_for_bite_text(stop_event):
+    """Wait until OCR sees a bite-related prompt."""
     log("Wait until OCR sees bite text.")
     end = time.perf_counter() + BITE_WAIT_TIMEOUT_MS / 1000.0
     while time.perf_counter() < end:
@@ -479,6 +552,7 @@ def wait_for_bite_text(stop_event):
 
 
 def wait_for_close_text(stop_event):
+    """Wait until OCR sees the close-overlay prompt."""
     log("Wait until OCR sees close text.")
     end = time.perf_counter() + CLOSE_WAIT_TIMEOUT_MS / 1000.0
     while time.perf_counter() < end:
@@ -518,7 +592,9 @@ def should_use_ocr_gpu():
         return False
 
 
+# ===== OCR thread =====
 def ocr_loop(stop_event):
+    """Continuously OCR the game window and publish detection events."""
     if not OCR_ENABLED:
         return
 
@@ -536,52 +612,13 @@ def ocr_loop(stop_event):
         while not stop_event.is_set():
             hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
             if hwnd:
-                bite_text = read_ocr_regions(reader, hwnd)
-                close_text = read_ocr_region(reader, hwnd, OCR_CLOSE_REGIONS_REF[0])
-                lost_fish_text = read_ocr_region(reader, hwnd, OCR_LOST_FISH_REGION_REF)
-                start_fish_text = read_ocr_region(reader, hwnd, OCR_START_FISH_REGION_REF)
-
-                # Keep one merged OCR snapshot for logging/debugging, but make
-                # each event depend on its own dedicated UI region.
-                text = " | ".join(
-                    part for part in (bite_text, close_text, lost_fish_text, start_fish_text) if part
-                )
-                set_last_ocr_text(text)
-
-                seen = OCR_TARGET_TEXT in normalize_text(bite_text)
-                bite_seen = text_seen_any(bite_text, OCR_BITE_KEYWORDS)
-                close_seen = text_seen_any(close_text, OCR_CLOSE_KEYWORDS)
-                lost_fish_seen = text_seen_exact(lost_fish_text, OCR_LOST_FISH_TEXT)
-                start_fish_seen = (
-                    normalize_text(OCR_START_FISH_TEXT) in normalize_text(start_fish_text)
-                )
-                if bite_seen:
-                    BITE_DETECTED_EVENT.set()
-                if close_seen:
-                    CLOSE_DETECTED_EVENT.set()
-                if lost_fish_seen:
-                    LOST_FISH_DETECTED_EVENT.set()
-                else:
-                    LOST_FISH_DETECTED_EVENT.clear()
-                if start_fish_seen:
-                    START_FISH_DETECTED_EVENT.set()
+                snapshot = update_detection_events(read_ocr_snapshot(reader, hwnd))
+                text = snapshot["combined_text"]
 
                 if text:
                     now = time.perf_counter()
                     if (now - last_print) * 1000 >= OCR_PRINT_COOLDOWN_MS:
-                        if start_fish_seen:
-                            status = "START"
-                        elif lost_fish_seen:
-                            status = "LOST"
-                        elif close_seen:
-                            status = "CLOSE"
-                        elif bite_seen:
-                            status = "BITE"
-                        elif seen:
-                            status = "MATCH"
-                        else:
-                            status = "TEXT"
-                        log(f"OCR {status}: {text}")
+                        log(f"OCR {ocr_status(snapshot)}: {text}")
                         last_print = now
 
             stop_event.wait(OCR_INTERVAL_MS / 1000.0)
@@ -591,7 +628,9 @@ def ocr_loop(stop_event):
         log("OCR disabled for this run; action loop will continue.")
 
 
+# ===== Fishing flow =====
 def fish_once(stop_event):
+    """Run one fishing cycle from focus acquisition to cleanup."""
     log("=== New loop ===")
     maybe_restart_from_ocr_events(stop_event)
     hwnd = activate_window()
@@ -636,6 +675,7 @@ def fish_once(stop_event):
     press_key(VK_ESC, 110)
 
 def wait_for_start():
+    """Wait for the user hotkey that starts the automation."""
     log("Ready.")
     log(f"Admin: {is_admin()}")
     log(f"Target window keyword: {TARGET_TITLE_KEYWORD}")
@@ -650,7 +690,9 @@ def wait_for_start():
         delay(50)
 
 
+# ===== Action / application threads =====
 def action_loop(stop_event):
+    """Main action thread that repeatedly executes fishing cycles."""
     try:
         wait_for_ocr_ready(stop_event)
         while not stop_event.is_set():
@@ -670,6 +712,7 @@ def action_loop(stop_event):
 
 
 def main():
+    """Program entry point: wait for start, then launch OCR + action threads."""
     setup_logging()
     log("Log file: " + os.path.abspath(LOG_FILE))
 
