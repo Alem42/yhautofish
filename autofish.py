@@ -21,6 +21,9 @@ OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"
 OCR_BITE_KEYWORDS = (
     "\u9c7c\u4e0a\u94a9",
     "\u4e0a\u94a9",
+    "\u9c7c\u94a9\u4e86",
+    "\u4e0a\u94a9\u4e86",
+    "\u9c7c\u52fe\u4e86",
 )
 OCR_CLOSE_KEYWORDS = (
     "\u70b9\u51fb\u7a7a\u767d\u533a\u57df\u5173\u95ed",
@@ -32,6 +35,7 @@ OCR_START_FISH_TEXT = "\u5f00\u59cb\u9493\u9c7c"       # "开始钓鱼"
 OCR_LOST_FISH_TEXT = "\u9c7c\u513f\u6e9c\u8d70\u4e86"   # "鱼儿溜走了"
 OCR_INTERVAL_MS = 1000
 OCR_PRINT_COOLDOWN_MS = 2000
+OCR_LOG_CAPTURE_REGION = False
 # OCR regions are based on a 1920x1080 client reference. They are split by
 # purpose so each event is only triggered by the UI area that should contain it.
 OCR_BITE_REGIONS_REF = (
@@ -48,6 +52,24 @@ CLOSE_WAIT_TIMEOUT_MS = 15000
 OCR_READY_TIMEOUT_MS = 60000
 START_FISH_CLICK_REF_X = 1600
 START_FISH_CLICK_REF_Y = 940
+FISH_BAR_REGION_REF = (592, 60, 1327, 86)
+FISH_BAR_LOOP_TIMEOUT_MS = 25000
+FISH_BAR_POLL_MS = 25
+FISH_BAR_MAX_MISSES = 8
+FISH_BAR_BLUE_LOWER_HSV = (78, 90, 120)
+FISH_BAR_BLUE_UPPER_HSV = (91, 255, 255)
+FISH_BAR_YELLOW_LOWER_HSV = (22, 70, 190)
+FISH_BAR_YELLOW_UPPER_HSV = (35, 255, 255)
+FISH_BAR_TARGET_MIN_WIDTH = 35
+FISH_BAR_CURSOR_MIN_WIDTH = 1
+FISH_BAR_CURSOR_MAX_WIDTH = 10
+FISH_BAR_TARGET_COLUMN_MIN_PIXELS = 3
+FISH_BAR_CURSOR_COLUMN_MIN_PIXELS = 5
+FISH_BAR_BAND_TOP_RATIO = 0.22
+FISH_BAR_BAND_BOTTOM_RATIO = 0.80
+FISH_BAR_DEADZONE_RATIO = 0.10
+FISH_BAR_MIN_DEADZONE_PX = 8
+FISH_BAR_RELEASE_RATIO = 0.60
 
 # Coordinates from the original macro, measured on a 1920x1080 game client.
 # They are scaled to the current game window client size at runtime.
@@ -62,6 +84,8 @@ RIGHT_CLICK_REF_Y = 1040
 FOCUS_CENTER_BEFORE_ACTION = True
 
 VK_F = 0x46
+VK_A = 0x41
+VK_D = 0x44
 VK_ESC = 0x1B
 VK_F10 = 0x79
 VK_F12 = 0x7B
@@ -249,6 +273,38 @@ def press_key(vk, hold_ms=110):
     key_up(vk)
 
 
+class DirectionKeyController:
+    """Track held A/D state so the fishing loop can steer smoothly."""
+
+    def __init__(self):
+        self.current = None
+
+    def set_direction(self, direction):
+        if direction == self.current:
+            return
+
+        if self.current == "left":
+            log("Release A")
+            key_up(VK_A)
+        elif self.current == "right":
+            log("Release D")
+            key_up(VK_D)
+
+        self.current = None
+
+        if direction == "left":
+            log("Hold A")
+            key_down(VK_A)
+            self.current = "left"
+        elif direction == "right":
+            log("Hold D")
+            key_down(VK_D)
+            self.current = "right"
+
+    def release_all(self):
+        self.set_direction(None)
+
+
 def move_to(x, y):
     log(f"MoveTo {x}, {y}")
     user32.SetCursorPos(x, y)
@@ -386,7 +442,8 @@ def capture_client_image(hwnd, ref_region=None):
         height = rect.bottom - rect.top
         left, top = client_to_screen(hwnd, 0, 0)
 
-    log(f"OCR capture region screen=({left},{top},{width},{height})")
+    if OCR_LOG_CAPTURE_REGION:
+        log(f"OCR capture region screen=({left},{top},{width},{height})")
 
     with mss.mss() as sct:
         shot = sct.grab({
@@ -398,6 +455,124 @@ def capture_client_image(hwnd, ref_region=None):
 
     # EasyOCR expects RGB image data. MSS returns BGRA.
     return np.asarray(shot)[:, :, :3][:, :, ::-1]
+
+
+def largest_contour_rect(mask, min_width=1, min_height=1, max_width=None, min_area=1):
+    import cv2
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_score = 0
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        if w < min_width or h < min_height or area < min_area:
+            continue
+        if max_width is not None and w > max_width:
+            continue
+        if area > best_score:
+            best = (x, y, w, h)
+            best_score = area
+
+    return best
+
+
+def longest_mask_run(column_counts, min_pixels, min_width=1, max_width=None):
+    best = None
+    start = None
+
+    for index, count in enumerate(column_counts):
+        active = count >= min_pixels
+        if active and start is None:
+            start = index
+            continue
+
+        if active:
+            continue
+
+        if start is None:
+            continue
+
+        width = index - start
+        if width >= min_width and (max_width is None or width <= max_width):
+            if best is None or width > best[2]:
+                best = (start, index - 1, width)
+        start = None
+
+    if start is not None:
+        width = len(column_counts) - start
+        if width >= min_width and (max_width is None or width <= max_width):
+            if best is None or width > best[2]:
+                best = (start, len(column_counts) - 1, width)
+
+    return best
+
+
+def detect_fishing_bar_state(hwnd):
+    """Locate the target zone and cursor inside the fishing bar."""
+    import cv2
+    import numpy as np
+
+    image = capture_client_image(hwnd, FISH_BAR_REGION_REF)
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    height, width = image.shape[:2]
+    band_top = max(0, int(round(height * FISH_BAR_BAND_TOP_RATIO)))
+    band_bottom = min(height, int(round(height * FISH_BAR_BAND_BOTTOM_RATIO)))
+    if band_bottom - band_top < 6:
+        return None
+
+    inner_hsv = hsv[band_top:band_bottom, :]
+
+    blue_mask = cv2.inRange(
+        inner_hsv,
+        np.array(FISH_BAR_BLUE_LOWER_HSV, dtype=np.uint8),
+        np.array(FISH_BAR_BLUE_UPPER_HSV, dtype=np.uint8),
+    )
+    yellow_mask = cv2.inRange(
+        inner_hsv,
+        np.array(FISH_BAR_YELLOW_LOWER_HSV, dtype=np.uint8),
+        np.array(FISH_BAR_YELLOW_UPPER_HSV, dtype=np.uint8),
+    )
+
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, np.ones((7, 3), dtype=np.uint8))
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+
+    blue_counts = np.count_nonzero(blue_mask, axis=0)
+    yellow_counts = np.count_nonzero(yellow_mask, axis=0)
+
+    target_run = longest_mask_run(
+        blue_counts,
+        min_pixels=FISH_BAR_TARGET_COLUMN_MIN_PIXELS,
+        min_width=FISH_BAR_TARGET_MIN_WIDTH,
+    )
+    cursor_run = longest_mask_run(
+        yellow_counts,
+        min_pixels=FISH_BAR_CURSOR_COLUMN_MIN_PIXELS,
+        min_width=FISH_BAR_CURSOR_MIN_WIDTH,
+        max_width=FISH_BAR_CURSOR_MAX_WIDTH,
+    )
+
+    if not target_run or not cursor_run:
+        return None
+
+    target_start, target_end, target_width = target_run
+    cursor_start, cursor_end, cursor_width = cursor_run
+    target_rect = (target_start, band_top, target_width, band_bottom - band_top)
+    cursor_rect = (cursor_start, band_top, cursor_width, band_bottom - band_top)
+
+    return {
+        "target_left": target_start,
+        "target_right": target_end,
+        "target_center_x": (target_start + target_end) / 2.0,
+        "target_width": target_width,
+        "cursor_center_x": (cursor_start + cursor_end) / 2.0,
+        "cursor_width": cursor_width,
+        "target_rect": target_rect,
+        "cursor_rect": cursor_rect,
+        "sample_band": (band_top, band_bottom),
+        "image_shape": image.shape,
+    }
 
 
 # ===== OCR text helpers =====
@@ -413,6 +588,20 @@ def normalize_text(text):
 def text_seen_any(text, keywords):
     normalized = normalize_text(text)
     return any(keyword in normalized for keyword in keywords)
+
+
+def bite_text_seen(text):
+    """Be tolerant of common OCR mistakes around the bite prompt."""
+    normalized = normalize_text(text)
+    if any(keyword in normalized for keyword in OCR_BITE_KEYWORDS):
+        return True
+
+    # EasyOCR often drops "上" and may misread "点击" around this prompt.
+    return (
+        "\u9c7c" in normalized
+        and ("\u94a9" in normalized or "\u52fe" in normalized)
+        and ("\u5feb" in normalized or "\u51fb" in normalized)
+    )
 
 
 def text_seen_exact(text, target):
@@ -469,7 +658,7 @@ def update_detection_events(snapshot):
     lost_fish_text = snapshot["lost_fish_text"]
     start_fish_text = snapshot["start_fish_text"]
 
-    bite_seen = text_seen_any(bite_text, OCR_BITE_KEYWORDS)
+    bite_seen = bite_text_seen(bite_text)
     close_seen = text_seen_any(close_text, OCR_CLOSE_KEYWORDS)
     lost_fish_seen = text_seen_exact(lost_fish_text, OCR_LOST_FISH_TEXT)
     start_fish_seen = normalize_text(OCR_START_FISH_TEXT) in normalize_text(start_fish_text)
@@ -491,8 +680,11 @@ def update_detection_events(snapshot):
     snapshot["lost_fish_seen"] = lost_fish_seen
     snapshot["start_fish_seen"] = start_fish_seen
     snapshot["target_seen"] = target_seen
-    snapshot["combined_text"] = " | ".join(part for part in snapshot.values() if isinstance(part, str) and part)
-    set_last_ocr_text(snapshot["combined_text"])
+    snapshot["combined_text"] = " | ".join(
+        part for part in snapshot.values() if isinstance(part, str) and part
+    )
+    if snapshot["combined_text"]:
+        set_last_ocr_text(snapshot["combined_text"])
     return snapshot
 
 
@@ -567,6 +759,110 @@ def wait_for_close_text(stop_event):
         delay(50)
 
     log(f"Close text timeout; last OCR text: {get_last_ocr_text()}")
+    return False
+
+
+def click_close_overlay_target(hwnd):
+    """Dismiss the result overlay by clicking the known bottom-right blank area."""
+    log("Click right target")
+    CLOSE_DETECTED_EVENT.clear()
+    click_at(*scaled_client_point(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y))
+
+
+def close_result_overlay(hwnd, stop_event):
+    """Wait for the close prompt, then click the bottom-right area and continue."""
+    if not wait_for_close_text(stop_event):
+        log("Close text timeout; skip right target click.")
+        return False
+
+    click_close_overlay_target(hwnd)
+    wait(250, stop_event)
+    return True
+
+
+def choose_fishing_direction(error, deadzone, release_zone, current_direction):
+    """Map bar offset to A/D direction with a small hysteresis band."""
+    if current_direction == "left":
+        if error >= release_zone:
+            return "left"
+        if error <= -deadzone:
+            return "right"
+        return None
+
+    if current_direction == "right":
+        if error <= -release_zone:
+            return "right"
+        if error >= deadzone:
+            return "left"
+        return None
+
+    if error >= deadzone:
+        return "left"
+    if error <= -deadzone:
+        return "right"
+    return None
+
+
+def play_fishing_bar(hwnd, stop_event):
+    """Steer the yellow cursor with A/D so it stays inside the blue target zone."""
+    log("Start visual fishing bar control.")
+    controller = DirectionKeyController()
+    end = time.perf_counter() + FISH_BAR_LOOP_TIMEOUT_MS / 1000.0
+    miss_count = 0
+    last_logged_error = None
+
+    try:
+        while time.perf_counter() < end:
+            if stop_event.is_set():
+                raise KeyboardInterrupt
+            if stop_requested():
+                log("F12 detected")
+                stop_event.set()
+                raise KeyboardInterrupt
+
+            maybe_restart_from_ocr_events(stop_event)
+
+            if CLOSE_DETECTED_EVENT.is_set():
+                log("Close text detected during visual control.")
+                return True
+
+            state = detect_fishing_bar_state(hwnd)
+            if state is None:
+                miss_count += 1
+                controller.release_all()
+                if miss_count >= FISH_BAR_MAX_MISSES:
+                    log("Fishing bar detection lost; stop visual control.")
+                    return False
+                delay(FISH_BAR_POLL_MS)
+                continue
+
+            miss_count = 0
+            target_width = state["target_width"]
+            deadzone = max(FISH_BAR_MIN_DEADZONE_PX, int(target_width * FISH_BAR_DEADZONE_RATIO))
+            release_zone = max(1, int(deadzone * FISH_BAR_RELEASE_RATIO))
+            error = state["cursor_center_x"] - state["target_center_x"]
+            direction = choose_fishing_direction(
+                error,
+                deadzone,
+                release_zone,
+                controller.current,
+            )
+            controller.set_direction(direction)
+
+            rounded_error = int(round(error))
+            if last_logged_error is None or abs(rounded_error - last_logged_error) >= 20:
+                log(
+                    f"Fishing bar track: cursor={state['cursor_center_x']:.1f} "
+                    f"target={state['target_center_x']:.1f} width={target_width} "
+                    f"error={rounded_error} direction={direction}"
+                )
+                last_logged_error = rounded_error
+
+            delay(FISH_BAR_POLL_MS)
+    finally:
+        controller.release_all()
+
+    log("Fishing bar control timeout; stop visual control.")
     return False
 
 
@@ -656,23 +952,13 @@ def fish_once(stop_event):
     press_key(VK_F, 110)
 
 
-    wait(650, stop_event)
-    maybe_restart_from_ocr_events(stop_event)
-    log("Click left target")
     CLOSE_DETECTED_EVENT.clear()
-    click_at(*scaled_client_point(hwnd, LEFT_CLICK_REF_X, LEFT_CLICK_REF_Y))
-    
-
-    if wait_for_close_text(stop_event):
-        log("Click right target")
-        click_at(*scaled_client_point(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y))
-    else:
-        log("Close text timeout; skip right target click.")
+    wait(300, stop_event)
+    play_fishing_bar(hwnd, stop_event)
+    close_result_overlay(hwnd, stop_event)
 
     wait(400, stop_event)
     maybe_restart_from_ocr_events(stop_event)
-    log("Press Esc")
-    press_key(VK_ESC, 110)
 
 def wait_for_start():
     """Wait for the user hotkey that starts the automation."""
