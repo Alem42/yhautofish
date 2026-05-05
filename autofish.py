@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+"""
+Main automation entrypoint.
+
+Static values such as OCR regions, timing knobs, key codes, and reference
+coordinates live in config.py. This file keeps runtime state and behavior:
+window control, OCR execution, visual fishing-bar tracking, and flow logic.
+"""
 
 import ctypes
 import logging
@@ -8,92 +15,22 @@ import threading
 import time
 from ctypes import wintypes
 
-
-# ===== Config =====
-# Window / logging / OCR switches.
-TARGET_TITLE_KEYWORD = "\u5f02\u73af"
-LOG_ENABLED = True
-LOG_FILE = "logs/autofish.log"
-OCR_ENABLED = True
-OCR_GPU_MODE = "auto"
-# OCR target texts.
-OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"
-OCR_BITE_KEYWORDS = (
-    "\u9c7c\u4e0a\u94a9",
-    "\u4e0a\u94a9",
-    "\u9c7c\u94a9\u4e86",
-    "\u4e0a\u94a9\u4e86",
-    "\u9c7c\u52fe\u4e86",
+from config import *  # Static script configuration; runtime state remains here.
+from ocr_utils import (
+    bite_text_seen,
+    empty_ocr_snapshot,
+    format_ocr_result,
+    need_bait_text_seen,
+    normalize_text,
+    read_easyocr_text,
+    read_ocr_fast_snapshot,
+    read_ocr_region,
+    read_ocr_regions,
+    read_result_overlay_text,
+    result_overlay_text_seen,
+    text_seen_any,
+    text_seen_exact,
 )
-OCR_CLOSE_KEYWORDS = (
-    "\u70b9\u51fb\u7a7a\u767d\u533a\u57df\u5173\u95ed",
-    "\u70b9\u51fb\u7a7a\u767d",
-    "\u7a7a\u767d\u533a\u57df",
-    "\u533a\u57df\u5173\u95ed",
-)
-OCR_START_FISH_TEXT = "\u5f00\u59cb\u9493\u9c7c"       # "开始钓鱼"
-OCR_LOST_FISH_TEXT = "\u9c7c\u513f\u6e9c\u8d70\u4e86"   # "鱼儿溜走了"
-OCR_INTERVAL_MS = 1000
-OCR_PRINT_COOLDOWN_MS = 2000
-OCR_LOG_CAPTURE_REGION = False
-# OCR regions are based on a 1920x1080 client reference. They are split by
-# purpose so each event is only triggered by the UI area that should contain it.
-OCR_BITE_REGIONS_REF = (
-    (450, 120, 1020, 520),
-    (620, 850, 1300, 1060),
-)
-OCR_CLOSE_REGIONS_REF = (
-    (620, 850, 1300, 1060),
-)
-OCR_LOST_FISH_REGION_REF = (480, 500, 1440, 660)
-OCR_START_FISH_REGION_REF = (1350, 800, 1820, 1030)
-BITE_WAIT_TIMEOUT_MS = 20000
-CLOSE_WAIT_TIMEOUT_MS = 15000
-OCR_READY_TIMEOUT_MS = 60000
-START_FISH_CLICK_REF_X = 1600
-START_FISH_CLICK_REF_Y = 940
-FISH_BAR_REGION_REF = (592, 60, 1327, 86)
-FISH_BAR_LOOP_TIMEOUT_MS = 25000
-FISH_BAR_POLL_MS = 25
-FISH_BAR_MAX_MISSES = 8
-FISH_BAR_BLUE_LOWER_HSV = (78, 90, 120)
-FISH_BAR_BLUE_UPPER_HSV = (91, 255, 255)
-FISH_BAR_YELLOW_LOWER_HSV = (22, 70, 190)
-FISH_BAR_YELLOW_UPPER_HSV = (35, 255, 255)
-FISH_BAR_TARGET_MIN_WIDTH = 35
-FISH_BAR_CURSOR_MIN_WIDTH = 1
-FISH_BAR_CURSOR_MAX_WIDTH = 10
-FISH_BAR_TARGET_COLUMN_MIN_PIXELS = 3
-FISH_BAR_CURSOR_COLUMN_MIN_PIXELS = 5
-FISH_BAR_BAND_TOP_RATIO = 0.22
-FISH_BAR_BAND_BOTTOM_RATIO = 0.80
-FISH_BAR_DEADZONE_RATIO = 0.10
-FISH_BAR_MIN_DEADZONE_PX = 8
-FISH_BAR_RELEASE_RATIO = 0.60
-
-# Coordinates from the original macro, measured on a 1920x1080 game client.
-# They are scaled to the current game window client size at runtime.
-REFERENCE_WIDTH = 1920
-REFERENCE_HEIGHT = 1080
-LEFT_CLICK_REF_X = 60
-LEFT_CLICK_REF_Y = 1020
-RIGHT_CLICK_REF_X = 1880
-RIGHT_CLICK_REF_Y = 1040
-
-# Click the game content once before the loop starts sending keys.
-FOCUS_CENTER_BEFORE_ACTION = True
-
-VK_F = 0x46
-VK_A = 0x41
-VK_D = 0x44
-VK_ESC = 0x1B
-VK_F10 = 0x79
-VK_F12 = 0x7B
-
-SW_RESTORE = 9
-KEYEVENTF_KEYUP = 0x0002
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
 
 # Cross-thread runtime state shared by the OCR thread and the action thread.
 OCR_READY_EVENT = threading.Event()
@@ -103,6 +40,9 @@ START_FISH_DETECTED_EVENT = threading.Event()
 LOST_FISH_DETECTED_EVENT = threading.Event()
 LAST_OCR_TEXT_LOCK = threading.Lock()
 LAST_OCR_TEXT = ""
+OCR_READER_LOCK = threading.Lock()
+OCR_READER = None
+OCR_TARGETED_READ_EVENT = threading.Event()
 
 
 class RestartLoop(Exception):
@@ -171,6 +111,14 @@ def delay(ms):
 
 
 def log(message):
+    if not LOG_ENABLED:
+        return
+    if threading.current_thread().name == "Action" and not ACTION_LOG_ENABLED:
+        return
+    logging.info(message)
+
+
+def log_force(message):
     if LOG_ENABLED:
         logging.info(message)
 
@@ -256,6 +204,21 @@ def wait(ms, stop_event=None):
         delay(50)
 
 
+def wait_no_restart(ms, stop_event=None):
+    """Delay between deterministic UI steps without OCR-driven loop restarts."""
+    log(f"Wait {ms}ms without OCR restart")
+    end = time.perf_counter() + ms / 1000.0
+    while time.perf_counter() < end:
+        if stop_event is not None and stop_event.is_set():
+            raise KeyboardInterrupt
+        if stop_requested():
+            log("F12 detected")
+            if stop_event is not None:
+                stop_event.set()
+            raise KeyboardInterrupt
+        delay(50)
+
+
 # ===== Mouse / keyboard input helpers =====
 def key_down(vk):
     user32.keybd_event(vk, 0, 0, 0)
@@ -323,6 +286,10 @@ def click_at(x, y):
     left_click()
 
 
+def click_client_ref(hwnd, ref_x, ref_y):
+    click_at(*scaled_client_point(hwnd, ref_x, ref_y))
+
+
 # ===== Window and coordinate helpers =====
 def get_client_rect(hwnd):
     rect = wintypes.RECT()
@@ -357,8 +324,8 @@ def click_client_center(hwnd):
     rect = get_client_rect(hwnd)
     width = rect.right - rect.left
     height = rect.bottom - rect.top
-    x, y = client_to_screen(hwnd, width / 2, height / 2)
-    log(f"Focus game client center: {x}, {y}")
+    x, y = client_to_screen(hwnd, width / 2, height / 2 + FOCUS_CENTER_Y_OFFSET)
+    log(f"Focus game client center offset: {x}, {y}")
     click_at(x, y)
 
 
@@ -575,39 +542,7 @@ def detect_fishing_bar_state(hwnd):
     }
 
 
-# ===== OCR text helpers =====
-def text_seen(result, target):
-    return target in normalize_text(format_ocr_result(result))
-
-
-def normalize_text(text):
-    ignored = set(" \t\r\n,，.。!！?？:：;；|/\\-_—[]()（）{}<>《》\"'`")
-    return "".join(ch for ch in str(text) if ch not in ignored)
-
-
-def text_seen_any(text, keywords):
-    normalized = normalize_text(text)
-    return any(keyword in normalized for keyword in keywords)
-
-
-def bite_text_seen(text):
-    """Be tolerant of common OCR mistakes around the bite prompt."""
-    normalized = normalize_text(text)
-    if any(keyword in normalized for keyword in OCR_BITE_KEYWORDS):
-        return True
-
-    # EasyOCR often drops "上" and may misread "点击" around this prompt.
-    return (
-        "\u9c7c" in normalized
-        and ("\u94a9" in normalized or "\u52fe" in normalized)
-        and ("\u5feb" in normalized or "\u51fb" in normalized)
-    )
-
-
-def text_seen_exact(text, target):
-    return normalize_text(text) == normalize_text(target)
-
-
+# ===== OCR runtime state helpers =====
 def set_last_ocr_text(text):
     global LAST_OCR_TEXT
     with LAST_OCR_TEXT_LOCK:
@@ -619,50 +554,30 @@ def get_last_ocr_text():
         return LAST_OCR_TEXT
 
 
-def format_ocr_result(result):
-    cleaned = [str(text).strip() for text in result if str(text).strip()]
-    return " | ".join(cleaned)
+def set_ocr_reader(reader):
+    global OCR_READER
+    with OCR_READER_LOCK:
+        OCR_READER = reader
 
 
-def read_ocr_regions(reader, hwnd):
-    texts = []
-    for region in OCR_BITE_REGIONS_REF:
-        image = capture_client_image(hwnd, region)
-        result = reader.readtext(image, detail=0, paragraph=True)
-        text = format_ocr_result(result)
-        if text:
-            texts.append(text)
-    return " | ".join(texts)
-
-
-def read_ocr_region(reader, hwnd, region):
-    image = capture_client_image(hwnd, region)
-    result = reader.readtext(image, detail=0, paragraph=True)
-    return format_ocr_result(result)
-
-
-def read_ocr_snapshot(reader, hwnd):
-    """Read every OCR region once and return named text blocks."""
-    return {
-        "bite_text": read_ocr_regions(reader, hwnd),
-        "close_text": read_ocr_region(reader, hwnd, OCR_CLOSE_REGIONS_REF[0]),
-        "lost_fish_text": read_ocr_region(reader, hwnd, OCR_LOST_FISH_REGION_REF),
-        "start_fish_text": read_ocr_region(reader, hwnd, OCR_START_FISH_REGION_REF),
-    }
+def get_ocr_reader():
+    with OCR_READER_LOCK:
+        return OCR_READER
 
 
 def update_detection_events(snapshot):
     """Update cross-thread event flags from one OCR snapshot."""
     bite_text = snapshot["bite_text"]
     close_text = snapshot["close_text"]
+    result_text = snapshot["result_text"]
     lost_fish_text = snapshot["lost_fish_text"]
     start_fish_text = snapshot["start_fish_text"]
 
-    bite_seen = bite_text_seen(bite_text)
-    close_seen = text_seen_any(close_text, OCR_CLOSE_KEYWORDS)
-    lost_fish_seen = text_seen_exact(lost_fish_text, OCR_LOST_FISH_TEXT)
-    start_fish_seen = normalize_text(OCR_START_FISH_TEXT) in normalize_text(start_fish_text)
-    target_seen = OCR_TARGET_TEXT in normalize_text(bite_text)
+    bite_seen = bite_text_seen(bite_text)  # "鱼上钩" / "上钩了"
+    close_seen = text_seen_any(close_text, OCR_CLOSE_KEYWORDS) or result_overlay_text_seen(result_text)  # Result overlay: "点击空白区域关闭" / "垂钓等级" / "获得钓鱼经验"
+    lost_fish_seen = text_seen_exact(lost_fish_text, OCR_LOST_FISH_TEXT)  # "鱼儿溜走了"
+    start_fish_seen = normalize_text(OCR_START_FISH_TEXT) in normalize_text(start_fish_text)  # "开始钓鱼"
+    target_seen = OCR_TARGET_TEXT in normalize_text(bite_text)  # "向左溜鱼"
 
     if bite_seen:
         BITE_DETECTED_EVENT.set()
@@ -726,20 +641,79 @@ def wait_for_ocr_ready(stop_event):
 
 def wait_for_bite_text(stop_event):
     """Wait until OCR sees a bite-related prompt."""
-    log("Wait until OCR sees bite text.")
-    end = time.perf_counter() + BITE_WAIT_TIMEOUT_MS / 1000.0
-    while time.perf_counter() < end:
-        if stop_event.is_set() or stop_requested():
-            stop_event.set()
-            raise KeyboardInterrupt
-        maybe_restart_from_ocr_events(stop_event)
-        if BITE_DETECTED_EVENT.is_set():
-            log(f"Bite text detected: {get_last_ocr_text()}")
-            BITE_DETECTED_EVENT.clear()
-            return True
-        delay(50)
+    return wait_for_bite_text_after_first_f(None, stop_event)
 
-    log(f"Bite text timeout; last OCR text: {get_last_ocr_text()}")
+
+def read_need_bait_text_once(hwnd, log_attempt=False):
+    reader = get_ocr_reader()
+    if not hwnd:
+        if log_attempt:
+            log_force("[NeedBait] skip OCR: hwnd not found")
+        return False
+    if reader is None:
+        if log_attempt:
+            log_force("[NeedBait] skip OCR: reader not ready")
+        return False
+
+    image = capture_client_image(hwnd, OCR_NEED_BAIT_REGION_REF)
+    raw_text = format_ocr_result(read_easyocr_text(reader, image))  # "需要装备鱼饵才可以钓鱼"
+    allowlist_text = ""
+    if not need_bait_text_seen(raw_text):
+        allowlist_text = format_ocr_result(
+            read_easyocr_text(reader, image, allowlist=OCR_NEED_BAIT_ALLOWLIST)
+        )
+    text = " | ".join(part for part in (raw_text, allowlist_text) if part)
+    if text:
+        set_last_ocr_text(text)
+    normalized = normalize_text(text)
+    seen = need_bait_text_seen(text)
+    if log_attempt or text:
+        log_force(
+            "[NeedBait] "
+            f"region={OCR_NEED_BAIT_REGION_REF} raw={raw_text!r} "
+            f"allowlist={allowlist_text!r} normalized={normalized!r} "
+            f"len={len(normalized)} seen={seen}"
+        )
+    return seen
+
+
+def wait_for_bite_text_after_first_f(hwnd, stop_event):
+    """Wait for "鱼上钩", and press the first F again if it stalls for 8s."""
+    log_force("[Bite] wait until OCR sees bite text")
+    end = time.perf_counter() + BITE_WAIT_TIMEOUT_MS / 1000.0
+    next_first_f = time.perf_counter() + FIRST_F_RETRY_MS / 1000.0
+    OCR_TARGETED_READ_EVENT.set()
+    try:
+        while time.perf_counter() < end:
+            if stop_event.is_set() or stop_requested():
+                stop_event.set()
+                raise KeyboardInterrupt
+            maybe_restart_from_ocr_events(stop_event)
+            if hwnd is None:
+                hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
+            reader = get_ocr_reader()
+            if hwnd and reader is not None:
+                snapshot = empty_ocr_snapshot()
+                snapshot["bite_text"] = read_ocr_regions(reader, hwnd, capture_client_image)  # "鱼上钩" / "向左溜鱼"
+                update_detection_events(snapshot)
+            if BITE_DETECTED_EVENT.is_set():
+                log_force(f"[Bite] detected: {get_last_ocr_text()}")
+                BITE_DETECTED_EVENT.clear()
+                return True
+            if time.perf_counter() >= next_first_f:
+                log_force("[Bite] not seen for 8s; press first F again")
+                BITE_DETECTED_EVENT.clear()
+                press_key(VK_F, 110)
+                wait_no_restart(NEED_BAIT_CHECK_DELAY_MS, stop_event)
+                if wait_for_need_bait_text_from_hwnd(hwnd, stop_event, NEED_BAIT_CHECK_TIMEOUT_MS):
+                    log_force(f"[NeedBait] detected after first-F retry: {get_last_ocr_text()}")
+                    recover_missing_bait(hwnd, stop_event)
+                next_first_f = time.perf_counter() + FIRST_F_RETRY_MS / 1000.0
+            delay(150)
+    finally:
+        OCR_TARGETED_READ_EVENT.clear()
+
+    log_force(f"[Bite] timeout; last OCR text: {get_last_ocr_text()}")
     return False
 
 
@@ -747,36 +721,120 @@ def wait_for_close_text(stop_event):
     """Wait until OCR sees the close-overlay prompt."""
     log("Wait until OCR sees close text.")
     end = time.perf_counter() + CLOSE_WAIT_TIMEOUT_MS / 1000.0
-    while time.perf_counter() < end:
-        if stop_event.is_set() or stop_requested():
-            stop_event.set()
-            raise KeyboardInterrupt
-        maybe_restart_from_ocr_events(stop_event)
-        if CLOSE_DETECTED_EVENT.is_set():
-            log(f"Close text detected: {get_last_ocr_text()}")
-            CLOSE_DETECTED_EVENT.clear()
-            return True
-        delay(50)
+    OCR_TARGETED_READ_EVENT.set()
+    try:
+        while time.perf_counter() < end:
+            if stop_event.is_set() or stop_requested():
+                stop_event.set()
+                raise KeyboardInterrupt
+            maybe_restart_from_ocr_events(stop_event)
+            hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
+            reader = get_ocr_reader()
+            if hwnd and reader is not None:
+                snapshot = empty_ocr_snapshot()
+                snapshot["close_text"] = read_ocr_region(reader, hwnd, OCR_CLOSE_REGIONS_REF[0], capture_client_image)  # "点击空白区域关闭"
+                snapshot["result_text"] = read_result_overlay_text(reader, hwnd, capture_client_image)  # "垂钓等级" / "获得钓鱼经验"
+                update_detection_events(snapshot)
+            if CLOSE_DETECTED_EVENT.is_set():
+                log(f"Close text detected: {get_last_ocr_text()}")
+                CLOSE_DETECTED_EVENT.clear()
+                return True
+            delay(150)
+    finally:
+        OCR_TARGETED_READ_EVENT.clear()
 
     log(f"Close text timeout; last OCR text: {get_last_ocr_text()}")
     return False
+
+
+def wait_for_need_bait_text(stop_event):
+    """Check the center banner for "需要装备鱼饵才可以钓鱼" after the first F."""
+    wait(NEED_BAIT_CHECK_DELAY_MS, stop_event)
+    log_force("[NeedBait] check after first F")
+    return wait_for_need_bait_text_from_hwnd(None, stop_event, NEED_BAIT_CHECK_TIMEOUT_MS)
+
+
+def wait_for_need_bait_text_from_hwnd(hwnd, stop_event, timeout_ms):
+    """Poll the center banner for "需要装备鱼饵才可以钓鱼"."""
+    log_force(f"[NeedBait] poll start timeout={timeout_ms}ms")
+    end = time.perf_counter() + timeout_ms / 1000.0
+    OCR_TARGETED_READ_EVENT.set()
+    try:
+        while time.perf_counter() < end:
+            if stop_event.is_set() or stop_requested():
+                stop_event.set()
+                raise KeyboardInterrupt
+            if hwnd is None:
+                hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
+            if read_need_bait_text_once(hwnd, log_attempt=True):
+                log_force(f"[NeedBait] detected: {get_last_ocr_text()}")
+                return True
+            delay(150)
+    finally:
+        OCR_TARGETED_READ_EVENT.clear()
+
+    log_force(f"[NeedBait] poll timeout; last OCR text: {get_last_ocr_text()}")
+    return False
+
+
+def bait_action_pause(stop_event):
+    wait_no_restart(NEED_BAIT_ACTION_DELAY_MS, stop_event)
+
+
+def recover_missing_bait(hwnd, stop_event):
+    """Equip bait through the fixed UI path, then restart the fishing loop."""
+    log_force("[NeedBait] ENTER recover_missing_bait")
+    log_force("[NeedBait] press R")
+    press_key(VK_R, 110)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] click bait UI point 1 ref=(360,230)")
+    click_client_ref(hwnd, 360, 230)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] click bait UI point 2 ref=(1824,948)")
+    click_client_ref(hwnd, 1824, 948)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] click bait UI point 3 ref=(1612,1030)")
+    click_client_ref(hwnd, 1612, 1030)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] click bait UI point 4 ref=(1160,700)")
+    click_client_ref(hwnd, 1160, 700)
+    bait_action_pause(stop_event)
+    bait_action_pause(stop_event)
+    bait_action_pause(stop_event)
+    click_close_overlay_target(hwnd)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] press Esc")
+    press_key(VK_ESC, 110)
+    bait_action_pause(stop_event)
+    bait_action_pause(stop_event)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] press E")
+    press_key(VK_E, 110)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] click final confirm ref=(1165,700)")
+    click_client_ref(hwnd, 1165, 700)
+    bait_action_pause(stop_event)
+    bait_action_pause(stop_event)
+    log_force("[NeedBait] recover_missing_bait finished; restart loop")
+    raise RestartLoop
 
 
 def click_close_overlay_target(hwnd):
     """Dismiss the result overlay by clicking the known bottom-right blank area."""
     log("Click right target")
     CLOSE_DETECTED_EVENT.clear()
-    click_at(*scaled_client_point(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y))
+    click_client_ref(hwnd, RIGHT_CLICK_REF_X, RIGHT_CLICK_REF_Y)
 
 
 def close_result_overlay(hwnd, stop_event):
-    """Wait for the close prompt, then click the bottom-right area and continue."""
-    if not wait_for_close_text(stop_event):
-        log("Close text timeout; skip right target click.")
-        return False
+    """Dismiss the result overlay quickly after the fishing bar disappears."""
+    wait(RESULT_CLOSE_CLICK_DELAY_MS, stop_event)
+
+    if RESULT_CLOSE_USE_OCR_CONFIRM and not wait_for_close_text(stop_event):
+        log("Result overlay OCR not confirmed; click fallback anyway.")
 
     click_close_overlay_target(hwnd)
-    wait(250, stop_event)
+    wait(RESULT_CLOSE_POST_CLICK_WAIT_MS, stop_event)
     return True
 
 
@@ -900,15 +958,16 @@ def ocr_loop(stop_event):
         log("OCR thread loading EasyOCR model...")
         use_gpu = should_use_ocr_gpu()
         log(f"OCR EasyOCR gpu={use_gpu}")
-        reader = easyocr.Reader(["ch_sim", "en"], gpu=use_gpu)
+        reader = easyocr.Reader(OCR_READER_LANGS, gpu=use_gpu)
+        set_ocr_reader(reader)
         log("OCR thread ready.")
         OCR_READY_EVENT.set()
 
         last_print = 0
         while not stop_event.is_set():
             hwnd = find_window(TARGET_TITLE_KEYWORD, announce=False)
-            if hwnd:
-                snapshot = update_detection_events(read_ocr_snapshot(reader, hwnd))
+            if hwnd and not OCR_TARGETED_READ_EVENT.is_set():
+                snapshot = update_detection_events(read_ocr_fast_snapshot(reader, hwnd, capture_client_image))
                 text = snapshot["combined_text"]
 
                 if text:
@@ -927,7 +986,7 @@ def ocr_loop(stop_event):
 # ===== Fishing flow =====
 def fish_once(stop_event):
     """Run one fishing cycle from focus acquisition to cleanup."""
-    log("=== New loop ===")
+    log_force("[Flow] === New loop ===")
     maybe_restart_from_ocr_events(stop_event)
     hwnd = activate_window()
     if not hwnd:
@@ -941,14 +1000,24 @@ def fish_once(stop_event):
 
     # Main fishing cycle. Any wait below can be interrupted by OCR if the
     # bottom-right "开始钓鱼" button appears again.
-    wait(500, stop_event)
-    log("First F")
+    wait(300, stop_event)
+    click_close_overlay_target(hwnd)    # left bottom click
+    wait(300, stop_event)
+    log_force("[Flow] First F")
     BITE_DETECTED_EVENT.clear()
     press_key(VK_F, 110)
 
-    wait_for_bite_text(stop_event)
+    log_force("[Flow] call wait_for_need_bait_text after First F")
+    if wait_for_need_bait_text(stop_event):
+        log_force("[Flow] wait_for_need_bait_text returned True; call recover_missing_bait")
+        recover_missing_bait(hwnd, stop_event)
+    log_force("[Flow] wait_for_need_bait_text returned False; continue to bite wait")
+
+    if not wait_for_bite_text_after_first_f(hwnd, stop_event):
+        log_force("[Flow] bite wait returned False; restart loop")
+        raise RestartLoop
     maybe_restart_from_ocr_events(stop_event)
-    log("Second F")
+    log_force("[Flow] Second F")
     press_key(VK_F, 110)
 
 
@@ -957,7 +1026,7 @@ def fish_once(stop_event):
     play_fishing_bar(hwnd, stop_event)
     close_result_overlay(hwnd, stop_event)
 
-    wait(400, stop_event)
+    wait(300, stop_event)
     maybe_restart_from_ocr_events(stop_event)
 
 def wait_for_start():
