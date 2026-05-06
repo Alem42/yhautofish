@@ -4,11 +4,11 @@ __pycache__/
 .venv/
 logs/
 captures/
+models/easyocr/*.pth
 
 # PyInstaller output
 build/
 dist/
-*.spec
 
 # Local editor/system files
 .vscode/
