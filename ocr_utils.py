@@ -138,7 +138,10 @@ def read_easyocr_text(reader, image, allowlist=None):
         )
 
 
-def read_ocr_regions(reader, hwnd, capture_client_image):
+def read_ocr_regions(reader, hwnd, capture_client_image, stop_when=None):
+    if stop_when is None:
+        stop_when = bite_text_seen
+
     texts = []
     for region in OCR_BITE_REGIONS_REF:
         image = capture_client_image(hwnd, region)
@@ -146,6 +149,8 @@ def read_ocr_regions(reader, hwnd, capture_client_image):
         text = format_ocr_result(result)
         if text:
             texts.append(text)
+            if stop_when is not None and stop_when(text):
+                return " | ".join(texts)
     return " | ".join(texts)
 
 
