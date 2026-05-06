@@ -13,7 +13,7 @@ LOG_ENABLED = True
 ACTION_LOG_ENABLED = False
 LOG_FILE = "logs/autofish.log"
 OCR_ENABLED = True
-OCR_GPU_MODE = "auto"
+OCR_GPU_MODE = False
 
 # OCR target texts.
 OCR_TARGET_TEXT = "\u5411\u5de6\u6e9c\u9c7c"  # "向左溜鱼"
@@ -50,6 +50,8 @@ OCR_PRINT_COOLDOWN_MS = 2000
 OCR_LOG_CAPTURE_REGION = False
 OCR_PREPROCESS_SCALE = 1.6
 OCR_READER_LANGS = ["ch_sim"]
+OCR_MODEL_DIR = "models/easyocr"
+OCR_DOWNLOAD_ENABLED = False
 
 # OCR regions are based on a 1920x1080 client reference. They are split by
 # purpose so each event is only triggered by the UI area that should contain it.

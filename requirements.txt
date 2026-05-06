@@ -1,8 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://download.pytorch.org/whl/cpu
 easyocr==1.7.2
 mss==10.2.0
 numpy==2.4.3
 opencv-python-headless==4.10.0.84
 pyinstaller
-torch==2.11.0+cu130
-torchvision==0.26.0+cu130
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu

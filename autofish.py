@@ -123,6 +123,41 @@ def log_force(message):
         logging.info(message)
 
 
+def app_root_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_runtime_path(relative_path):
+    normalized = os.path.normpath(relative_path)
+    candidates = [
+        os.path.join(app_root_dir(), normalized),
+    ]
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        candidates.append(os.path.join(bundle_dir, normalized))
+    candidates.append(os.path.join(os.getcwd(), normalized))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def resolve_ocr_model_dir():
+    model_dir = resolve_runtime_path(OCR_MODEL_DIR)
+    required_files = ("craft_mlt_25k.pth", "zh_sim_g2.pth")
+    missing = [name for name in required_files if not os.path.isfile(os.path.join(model_dir, name))]
+    if missing:
+        log(
+            "OCR model files missing from "
+            f"{model_dir}: {', '.join(missing)}. "
+            f"download_enabled={OCR_DOWNLOAD_ENABLED}"
+        )
+    return model_dir
+
+
 def is_admin():
     try:
         return bool(shell32.IsUserAnAdmin())
@@ -956,9 +991,15 @@ def ocr_loop(stop_event):
         import easyocr
 
         log("OCR thread loading EasyOCR model...")
+        model_dir = resolve_ocr_model_dir()
         use_gpu = should_use_ocr_gpu()
-        log(f"OCR EasyOCR gpu={use_gpu}")
-        reader = easyocr.Reader(OCR_READER_LANGS, gpu=use_gpu)
+        log(f"OCR EasyOCR gpu={use_gpu} model_dir={model_dir}")
+        reader = easyocr.Reader(
+            OCR_READER_LANGS,
+            gpu=use_gpu,
+            model_storage_directory=model_dir,
+            download_enabled=OCR_DOWNLOAD_ENABLED,
+        )
         set_ocr_reader(reader)
         log("OCR thread ready.")
         OCR_READY_EVENT.set()
@@ -1066,8 +1107,38 @@ def action_loop(stop_event):
         stop_event.set()
 
 
+def ocr_self_test():
+    """Load EasyOCR once so packaged OCR dependencies can be verified."""
+    import easyocr
+    import torch
+
+    model_dir = resolve_ocr_model_dir()
+    torch_status = f"torch={torch.__version__} cuda_available={torch.cuda.is_available()}"
+    model_status = f"easyocr_model_dir={model_dir}"
+    print(torch_status)
+    print(model_status)
+    log_force(torch_status)
+    log_force(model_status)
+    reader = easyocr.Reader(
+        OCR_READER_LANGS,
+        gpu=False,
+        model_storage_directory=model_dir,
+        download_enabled=OCR_DOWNLOAD_ENABLED,
+        verbose=False,
+    )
+    reader_status = f"easyocr_reader_device={reader.device}"
+    print(reader_status)
+    log_force(reader_status)
+    return 0
+
+
 def main():
     """Program entry point: wait for start, then launch OCR + action threads."""
+    if "--ocr-self-test" in sys.argv:
+        setup_logging()
+        log("Log file: " + os.path.abspath(LOG_FILE))
+        return ocr_self_test()
+
     setup_logging()
     log("Log file: " + os.path.abspath(LOG_FILE))
 
